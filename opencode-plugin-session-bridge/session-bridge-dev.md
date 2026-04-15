@@ -65,7 +65,7 @@ Plugin 拦截：
 ├── commands/
 │   └── peek.md              # 命令定义（极简，仅作为入口）
 └── plugins/
-    └── session-bridge.ts     # Plugin 核心逻辑
+    └── session-bridge.ts     # Plugin 核心逻辑（~330 行）
 ```
 
 `peek.md` 的模板内容无关紧要（因为 throw 会阻断），但必须存在以让 `/peek` 成为合法命令。
@@ -89,7 +89,7 @@ Plugin 拦截：
 4. 剩余全部 token join(" ") 为会话名
 ```
 
-另外支持中英文双引号包裹会话名：`/peek "前端 开发" 3 all`
+另外支持中英文双引号包裹会话名：`/peek "前端 开发" 3 all`（支持 `""` `""` `「」`）
 
 ### 2. Turn 分组
 
@@ -154,6 +154,22 @@ Bun.markdown.render(text, {
 
 这样最新的消息在最下面（靠近输入框光标），便于阅读和编辑。
 
+### 7. question tool 问答提取
+
+**问题**：AI 的 question 工具产生的对话框（选择题/确认框）在 message parts 中是 `type === "tool"` 而非 `type === "text"`，默认会被跳过。
+
+**方案**：在 `extractTurnText` 中额外处理 `type === "tool" && tool === "question"` 的 part，从 `state.input.questions` 提取问题文本和选项列表，从 `state.output` 提取答案（纯文本，不需要 JSON 解析）。未回答的问题显示 `(待回答)`。
+
+```
+Q: 对于行数的更新策略——代码行数会持续变化。你希望我怎么处理？
+  1. 删除整节（推荐）：从 PSD_EXPORT.md 中完全移除§八...
+  2. 标注 [未实现]：保留内容但在标题加明显标注...
+  3. 实现它：根据文档描述实现代码逻辑...
+A: 实现它
+```
+
+question 内容归属于所在的 turn，正常参与轮次计数和过滤。
+
 ---
 
 ## 开发中遇到的坑
@@ -214,16 +230,44 @@ Bun.markdown.render(text, {
 
 **解决**：在 turn 层面过滤空文本。一个 turn 内所有 message 拼接后为空才跳过。
 
+### 坑 8：API 默认只返回 100 个 session
+
+**现象**：`/peek 网页UI识别库对比分析` 提示找不到，但 TUI 的 session 列表里能看到。
+
+**原因**：`GET /session` API 有一个**未文档化**的 `limit` 参数，默认值为 100。SDK 的 `session.list()` 不暴露此参数。总共 309 个 session（含子 session），API 只返回 100 个，较老的 session 被截断。
+
+**验证方式**：通过 Plugin 中的调试日志确认 `sessions count=100`，且目标 session 不在返回列表中。
+
+**尝试过的方案**：
+1. 直接 `fetch(baseUrl + "/session?limit=1000")` — 失败，SDK 走自定义通信管道（通过 node gateway 进程），`getConfig().baseUrl` 是名义值（`http://localhost:4096`），但实际无 HTTP 服务监听该端口，直接 fetch 报 "Unable to connect"
+2. `client._client.get({ url: "/session", query: { limit: 1000 } })` — SDK 内部 raw client 发请求，可以传 limit 参数，但 response 格式不稳定，匹配结果不可靠
+3. **最终方案**：回退到 `client.session.list()`（受 100 条限制），在匹配失败时检测 API 返回总数是否接近 100（`>= 95`），若是则提示用户"目标对话可能太久不活跃，请先切到目标对话刷新排序后重试"。简单可靠，不依赖 SDK 内部实现
+
+### 坑 9：question tool 的选项内容需要单独提取
+
+**现象**：`/peek` 能拿到 question 的问题文本和答案，但看不到选项列表。
+
+**原因**：初版代码只从 `state.input.questions[i].question` 提取问题文本，忽略了 `options` 数组（每项有 `label` 和 `description` 字段）。
+
+**解决**：遍历 `q.options`，格式化为 `1. 标签：描述` 形式追加到问题后面。`state.output` 是纯文本答案，直接使用无需 JSON 解析。未回答的问题（`status !== "completed"`）显示 `(待回答)`。
+
+---
+
+## 已知限制
+
+1. **API 返回上限 100 条 session** — 太久不活跃的 session 不在返回范围内，需要用户先切到目标对话刷新排序。无法通过 SDK 或直接 fetch 绕过此限制（SDK 通信管道非标准 HTTP）。
+2. **`tui.command.execute` 不能阻断命令** — 只是通知事件，不是拦截钩子。TUI 原生命令注册在 Go 层，JS Plugin 无法注册。
+3. **`appendPrompt` 无法指定目标 session** — 只能写入当前 TUI 焦点的 session。跨 session 推送不可行，只能用 pull 模式。
+
 ---
 
 ## API 依赖
 
 | API | 用途 | 文档 |
 |-----|------|------|
-| `client.session.list()` | 列出所有 session | [SDK docs](https://opencode.ai/docs/sdk/) |
+| `client.session.list()` | 列出 session（默认上限 100 条） | [SDK docs](https://opencode.ai/docs/sdk/) |
 | `client.session.messages()` | 读取 session 消息 | [SDK docs](https://opencode.ai/docs/sdk/) |
 | `client.tui.appendPrompt()` | 写入 TUI 输入框 | [Server docs](https://opencode.ai/docs/server/) |
-| `client.tui.showToast()` | （已弃用）显示 toast | [Server docs](https://opencode.ai/docs/server/) |
 | `Bun.markdown.render()` | Markdown 转纯文本 | [Bun docs](https://bun.sh/docs/runtime/markdown) |
 | `command.execute.before` hook | 拦截命令 | [Plugin docs](https://opencode.ai/docs/plugins/) |
 
@@ -233,9 +277,10 @@ Bun.markdown.render(text, {
 {
   id: string          // 30 字符，格式 ses_xxxx
   title: string       // 会话标题
-  parentID?: string   // 子会话才有，用于排除 subagent 临时会话
+  parentID?: string   // 子会话才有（可选字段，无 parent 时字段不存在）
   time: {
-    updated: number   // Unix ms，用于排序
+    created: number   // Unix ms
+    updated: number   // Unix ms，随消息活动更新，用于排序
   }
 }
 ```
@@ -249,8 +294,21 @@ Bun.markdown.render(text, {
   },
   parts: [
     { type: "text", text: string },
-    { type: "tool-invocation", ... },
-    // ...
+    {
+      type: "tool",
+      tool: "question",           // question tool 特有
+      state: {
+        status: "pending" | "running" | "completed" | "error",
+        input: {
+          questions: [{
+            question: string,     // 完整问题文本
+            header: string,       // 短标签
+            options: [{ label: string, description: string }]
+          }]
+        },
+        output: string            // 纯文本答案（completed 时）
+      }
+    }
   ]
 }
 ```
