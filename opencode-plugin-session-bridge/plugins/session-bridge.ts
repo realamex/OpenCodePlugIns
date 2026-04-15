@@ -51,10 +51,11 @@ export const SessionBridge: Plugin = async ({ client }) => {
   /** 获取非当前、非子 session 列表，按 time.updated 升序（最新在最后） */
   async function getOtherSessions(currentId: string) {
     const res = await client.session.list()
-    const all = res.data ?? []
-    return all
+    const all = Array.isArray(res) ? res : (res?.data ?? [])
+    const others = all
       .filter((s: any) => s.id !== currentId && !s.parentID)
       .sort((a: any, b: any) => (a.time?.updated ?? 0) - (b.time?.updated ?? 0))
+    return { others, totalFromApi: all.length }
   }
 
   /**
@@ -149,17 +150,39 @@ export const SessionBridge: Plugin = async ({ client }) => {
     return result.filter((t) => extractTurnText(t).trim().length > 0)
   }
 
-  /** 从一个 turn 的所有消息中提取并拼接文本 */
+  /** 从一个 turn 的所有消息中提取并拼接文本（含 question tool 问答） */
   function extractTurnText(turn: Turn): string {
-    const parts: string[] = []
+    const chunks: string[] = []
     for (const m of turn.messages) {
-      const text = (m.parts ?? [])
-        .filter((p: any) => p.type === "text")
-        .map((p: any) => p.text ?? "")
-        .join("")
-      if (text.trim()) parts.push(text)
+      for (const p of m.parts ?? []) {
+        if (p.type === "text" && p.text?.trim()) {
+          chunks.push(p.text)
+        } else if (p.type === "tool" && p.tool === "question" && p.state?.input) {
+          const questions = p.state.input.questions
+          if (!Array.isArray(questions)) continue
+          for (const q of questions) {
+            const qText = q.question ?? q.header ?? ""
+            if (!qText.trim()) continue
+            // 展示选项列表
+            const opts = (q.options ?? [])
+              .map((o: any, i: number) => {
+                const label = o.label ?? o
+                const desc = o.description ? `：${o.description}` : ""
+                return `  ${i + 1}. ${label}${desc}`
+              })
+              .join("\n")
+            const answer = p.state?.status === "completed" && p.state?.output
+              ? p.state.output
+              : "(待回答)"
+            const block = opts
+              ? `Q: ${qText}\n${opts}\nA: ${answer}`
+              : `Q: ${qText}\nA: ${answer}`
+            chunks.push(block)
+          }
+        }
+      }
     }
-    return stripMarkdown(parts.join("\n\n"))
+    return stripMarkdown(chunks.join("\n\n"))
   }
 
   /** 用 Bun 内置 markdown 解析器将 markdown 转为纯文本（零依赖） */
@@ -223,8 +246,11 @@ export const SessionBridge: Plugin = async ({ client }) => {
       if (parsed.error) await done(parsed.error)
 
       let others: any[]
+      let totalFromApi = 0
       try {
-        others = await getOtherSessions(currentId)
+        const result = await getOtherSessions(currentId)
+        others = result.others
+        totalFromApi = result.totalFromApi
       } catch {
         await done("[/peek 错误] 获取 session 列表失败")
       }
@@ -261,6 +287,15 @@ export const SessionBridge: Plugin = async ({ client }) => {
         reversed.find((s: any) => s.id.startsWith(keyword))
 
       if (!target) {
+        // 判断是否因为 API 返回上限（默认 100 条）导致老 session 被截断
+        const isTruncated = totalFromApi >= 95
+        if (isTruncated) {
+          await done(
+            `[/peek 未找到 "${keyword}"]` +
+            `\n目标对话可能太久不活跃，不在最近记录中。` +
+            `\n请先切到目标对话发送任意消息刷新排序后重试。`
+          )
+        }
         if (others!.length) {
           const suggestions = others!
             .slice(-3)
