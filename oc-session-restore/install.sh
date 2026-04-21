@@ -38,34 +38,20 @@ if ! echo "$PATH" | tr ':' '\n' | grep -q "$BIN_DIR"; then
   warn "$BIN_DIR is not in PATH. Add to .zshrc: export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi
 
-# ── 2. zsh 插件（opencode 退出时自动 scan） ──
-ZSH_PLUGIN_DIR="$HOME/.local/share/zsh/plugins/oc-session-restore"
-mkdir -p "$ZSH_PLUGIN_DIR"
-ln -sf "$SCRIPT_DIR/oc-session-restore.plugin.zsh" "$ZSH_PLUGIN_DIR/oc-session-restore.plugin.zsh"
-log "Zsh plugin linked to $ZSH_PLUGIN_DIR/"
+# ── 2. 清理旧版本残留 ──
+rm -f "$HOME/.config/opencode/plugins/session-tracker.js" 2>/dev/null
+rm -f "$HOME/.config/opencode/plugins/session-tracker.ts" 2>/dev/null
+rm -f "$HOME/.local/share/zsh/plugins/oc-session-restore/oc-session-restore.plugin.zsh" 2>/dev/null
+rm -f "$HOME/.local/bin/oc-scan-periodic" 2>/dev/null
+# 卸载旧的 launchd agent（如果存在）
+launchctl bootout "gui/$(id -u)/com.oc-session-restore.scan" 2>/dev/null || true
+rm -f "$HOME/Library/LaunchAgents/com.oc-session-restore.scan.plist" 2>/dev/null
 
-ZSHRC="$HOME/.zshrc"
-if [ -f "$ZSHRC" ] && grep -qF "oc-session-restore.plugin.zsh" "$ZSHRC"; then
-  log ".zshrc already has source line."
-else
-  echo "" >> "$ZSHRC"
-  echo "# oc-session-restore: opencode 退出时自动快照会话" >> "$ZSHRC"
-  echo "source \"$ZSH_PLUGIN_DIR/oc-session-restore.plugin.zsh\"" >> "$ZSHRC"
-  log "Added source line to $ZSHRC"
-fi
-
-# ── 3. opencode 插件（session 切换时自动 scan） ──
-OC_PLUGIN_DIR="$HOME/.config/opencode/plugins"
-mkdir -p "$OC_PLUGIN_DIR"
-ln -sf "$SCRIPT_DIR/plugin/session-tracker.js" "$OC_PLUGIN_DIR/session-tracker.js"
-log "OpenCode plugin linked to $OC_PLUGIN_DIR/"
-
-# ── 4. cmux 自定义命令 ──
+# ── 3. cmux 自定义命令 ──
 CMUX_JSON="$HOME/.config/cmux/cmux.json"
 mkdir -p "$(dirname "$CMUX_JSON")"
 OC_SCAN_CMD="$HOME/.local/bin/oc-scan"
 OC_RESTORE_CMD="$HOME/.local/bin/oc-restore"
-# workspace 类型命令：任何分页下都能触发，自动创建新终端执行
 NEW_CMDS="$(jq -n \
   --arg scan "$OC_SCAN_CMD" \
   --arg restore "$OC_RESTORE_CMD" '
@@ -93,26 +79,39 @@ NEW_CMDS="$(jq -n \
         focus: true
       }]}}
     }
+  },
+  {
+    name: "Start Auto-Scan (background)",
+    keywords: ["auto","autoscan","background","oc"],
+    workspace: {
+      name: "OC Auto-Scan",
+      layout: { pane: { surfaces: [{
+        type: "terminal",
+        command: ("echo \"Auto-scan started. Scanning every 60s.\"; echo \"Keep this tab open (can be pinned).\"; echo \"\"; while true; do sleep 60; " + $scan + " --periodic 2>/dev/null && echo \"$(date +%H:%M) scanned\" || true; done"),
+        focus: true
+      }]}}
+    }
   }
 ]')"
 if [ -f "$CMUX_JSON" ]; then
   tmpfile=$(mktemp)
   jq --argjson new "$NEW_CMDS" '
-    .commands = [.commands[]? | select(.name | (contains("Scan OpenCode") or contains("Restore OpenCode")) | not)] + $new
+    .commands = [.commands[]? | select(.name | (contains("Scan OpenCode") or contains("Restore OpenCode") or contains("Auto-Scan")) | not)] + $new
   ' "$CMUX_JSON" > "$tmpfile" && mv "$tmpfile" "$CMUX_JSON"
-  log "Updated cmux.json with scan + restore commands (workspace type)"
+  log "Updated cmux.json with scan + restore + auto-scan commands"
 else
   echo "{\"commands\":$NEW_CMDS}" | jq . > "$CMUX_JSON"
-  log "Created cmux.json with scan + restore commands"
+  log "Created cmux.json with scan + restore + auto-scan commands"
 fi
 
-# ── 5. state 目录 ──
+# ── 4. state 目录 ──
 mkdir -p "$HOME/.local/state/oc-session-restore"
 log "State directory ready."
 
 echo ""
-echo "Done! Restart shell or: source ~/.zshrc"
+echo "Done!"
 echo ""
-echo "Commands:"
-echo "  oc-scan     Snapshot all current OpenCode sessions"
-echo "  oc-restore  Restore sessions after cmux restart (or Cmd+P > Restore)"
+echo "Usage:"
+echo "  Cmd+P > 'Auto-Scan' — start background scan (every 60s, keep tab open)"
+echo "  Cmd+P > 'Scan'      — manual one-time snapshot"
+echo "  Cmd+P > 'Restore'   — restore after cmux restart"

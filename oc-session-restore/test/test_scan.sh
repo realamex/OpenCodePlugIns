@@ -205,5 +205,104 @@ assert_eq "" "$output" "quiet mode should produce no output"
 teardown_scan_mock
 teardown_test_env
 
+# ─────────────────────────────────────────────
+describe "oc-scan --periodic — 状态机逻辑"
+# ─────────────────────────────────────────────
+
+it "should NOT save on first run (no previous scan to compare)"
+setup_test_env
+setup_scan_mock
+setup_scan_data
+echo '{}' > "$STATE_FILE"
+"$PROJECT_DIR/bin/oc-scan" --periodic 2>/dev/null
+# state.json 应该还是空的（第一次没有 prev_ids 可比较）
+assert_json_count "$STATE_FILE" 'keys | length' "0"
+teardown_scan_mock
+teardown_test_env
+
+it "should save on second consecutive identical run"
+setup_test_env
+setup_scan_mock
+setup_scan_data
+echo '{}' > "$STATE_FILE"
+# 第 1 次：建立 prev
+"$PROJECT_DIR/bin/oc-scan" --periodic 2>/dev/null
+assert_json_count "$STATE_FILE" 'keys | length' "0"
+# 第 2 次：和 prev 一致 → 保存
+"$PROJECT_DIR/bin/oc-scan" --periodic 2>/dev/null
+assert_json_count "$STATE_FILE" 'keys | length' "2"
+teardown_scan_mock
+teardown_test_env
+
+it "should NOT save again on third identical run (already saved)"
+setup_test_env
+setup_scan_mock
+setup_scan_data
+echo '{}' > "$STATE_FILE"
+"$PROJECT_DIR/bin/oc-scan" --periodic 2>/dev/null  # 1st: set prev
+"$PROJECT_DIR/bin/oc-scan" --periodic 2>/dev/null  # 2nd: save
+# 记录保存后的 mtime
+saved_mtime=$(stat -f %m "$STATE_FILE")
+sleep 1
+"$PROJECT_DIR/bin/oc-scan" --periodic 2>/dev/null  # 3rd: should skip
+current_mtime=$(stat -f %m "$STATE_FILE")
+assert_eq "$saved_mtime" "$current_mtime" "state file should not be rewritten"
+teardown_scan_mock
+teardown_test_env
+
+it "should NOT save when result is empty"
+setup_test_env
+setup_scan_mock
+setup_scan_data
+# 设置一个有数据的 state（模拟之前保存过的好快照）
+echo '{"old":{"sessionId":"ses_X","workspaceId":"ws-X","cwd":"/tmp"}}' > "$STATE_FILE"
+# 覆盖 tree 为无 OC workspace
+export MOCK_CMUX_TREE_JSON='{"windows":[{"workspaces":[{"ref":"workspace:1","title":"Terminal","panes":[{"surfaces":[{"ref":"surface:1","type":"terminal","tty":"ttys001","title":"zsh"}]}]}]}]}'
+"$PROJECT_DIR/bin/oc-scan" --periodic 2>/dev/null
+"$PROJECT_DIR/bin/oc-scan" --periodic 2>/dev/null
+# 旧快照应该保留（空结果不保存）
+assert_json_field "$STATE_FILE" '."old".sessionId' "ses_X"
+teardown_scan_mock
+teardown_test_env
+
+it "should save again after sessions change and stabilize"
+setup_test_env
+setup_scan_mock
+setup_scan_data
+echo '{}' > "$STATE_FILE"
+# 第 1+2 次：原始 2 session → 保存
+"$PROJECT_DIR/bin/oc-scan" --periodic 2>/dev/null
+"$PROJECT_DIR/bin/oc-scan" --periodic 2>/dev/null
+assert_json_count "$STATE_FILE" 'keys | length' "2"
+# 修改数据：只剩 1 个 session
+export MOCK_CMUX_TREE_JSON='{"windows":[{"workspaces":[{"ref":"workspace:1","title":"OC | Session Alpha","panes":[{"surfaces":[{"ref":"surface:1","type":"terminal","tty":"ttys001","title":"OpenCode"}]}]}]}]}'
+printf '  1001 opencode\n' > "$MOCK_PS_PIDLIST"
+# 第 3 次：变化了，不保存
+"$PROJECT_DIR/bin/oc-scan" --periodic 2>/dev/null
+assert_json_count "$STATE_FILE" 'keys | length' "2"  # 还是旧的 2 条
+# 第 4 次：和第 3 次一致 → 保存新的 1 条
+"$PROJECT_DIR/bin/oc-scan" --periodic 2>/dev/null
+assert_json_count "$STATE_FILE" 'keys | length' "1"
+teardown_scan_mock
+teardown_test_env
+
+it "should allow manual scan to override periodic state"
+setup_test_env
+setup_scan_mock
+setup_scan_data
+echo '{}' > "$STATE_FILE"
+# 手动 scan（不带 --periodic）直接保存
+"$PROJECT_DIR/bin/oc-scan" --quiet 2>/dev/null
+assert_json_count "$STATE_FILE" 'keys | length' "2"
+# 后续 periodic 不会重复保存（saved_ids 已同步）
+"$PROJECT_DIR/bin/oc-scan" --periodic 2>/dev/null
+saved_mtime=$(stat -f %m "$STATE_FILE")
+sleep 1
+"$PROJECT_DIR/bin/oc-scan" --periodic 2>/dev/null
+current_mtime=$(stat -f %m "$STATE_FILE")
+assert_eq "$saved_mtime" "$current_mtime" "periodic should not re-save after manual scan"
+teardown_scan_mock
+teardown_test_env
+
 # ── 输出摘要 ──
 print_summary

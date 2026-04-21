@@ -1,10 +1,10 @@
 #!/bin/bash
-# bin/oc-scan — 全量快照当前 cmux 中所有 OpenCode 会话，原子写入 state file
+# bin/oc-scan — 全量快照当前 cmux 中所有 OpenCode 会话
 #
-# 用法: oc-scan [--quiet]
-#
-# 防重复：取消旧 scan 进程，确保只有最后一次 scan 的数据写入
-# 原子写入：先写 tmp 文件，全部就绪后 mv 到 state.json
+# 用法:
+#   oc-scan             交互模式：扫描并立即保存
+#   oc-scan --quiet     静默模式：同上但无输出
+#   oc-scan --periodic  周期模式：连续两次一致且非空才保存，已保存过不重复保存
 
 set -euo pipefail
 
@@ -15,8 +15,15 @@ SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$PROJECT_DIR/lib/state.sh"
 
+# ── 参数解析 ──
 QUIET=""
-[ "${1:-}" = "--quiet" ] && QUIET=1
+PERIODIC=""
+for arg in "$@"; do
+  case "$arg" in
+    --quiet) QUIET=1 ;;
+    --periodic) PERIODIC=1; QUIET=1 ;;
+  esac
+done
 
 C_GREEN='\033[0;32m'
 C_YELLOW='\033[1;33m'
@@ -24,15 +31,14 @@ C_RED='\033[0;31m'
 C_DIM='\033[2m'
 C_RESET='\033[0m'
 
-log()  { [ -z "$QUIET" ] && echo -e "$@" || true; }
+log() { [ -z "$QUIET" ] && echo -e "$@" || true; }
 
-# ── 1. 防重复：kill 旧 scan，写入自己的 PID ──
+# ── 防重复：kill 旧 scan，写入自己的 PID ──
 mkdir -p "$STATE_DIR"
 if [ -f "$SCAN_PID_FILE" ]; then
   old_pid=$(cat "$SCAN_PID_FILE" 2>/dev/null)
   if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
     kill "$old_pid" 2>/dev/null || true
-    # 等旧进程退出（最多 1 秒）
     for _ in $(seq 1 10); do
       kill -0 "$old_pid" 2>/dev/null || break
       sleep 0.1
@@ -41,19 +47,17 @@ if [ -f "$SCAN_PID_FILE" ]; then
 fi
 echo $$ > "$SCAN_PID_FILE"
 
-# 清理函数：退出时删除 PID 文件和残留 tmp 目录
 cleanup() {
   rm -f "$SCAN_PID_FILE" 2>/dev/null
   rm -rf "$STATE_DIR"/scan.tmp.* 2>/dev/null
 }
 trap cleanup EXIT
 
-# ── 2. 获取 cmux tree ──
-TREE_JSON=$(cmux tree --json --all 2>/dev/null) || { log "Error: cmux tree failed."; exit 1; }
+# ── 扫描：获取 cmux tree ──
+TREE_JSON=$(cmux tree --json --all 2>/dev/null) || exit 0
 
 TMPDIR_SCAN=$(mktemp -d "${STATE_DIR}/scan.tmp.XXXXXX")
 
-# 提取所有 "OC | xxx" workspace
 echo "$TREE_JSON" | jq -r '
   [
     .windows[].workspaces[] |
@@ -73,15 +77,18 @@ echo "$TREE_JSON" | jq -r '
 SURFACE_COUNT=$(jq 'length' "$TMPDIR_SCAN/surfaces.json")
 if [ "$SURFACE_COUNT" = "0" ]; then
   log "No OpenCode workspaces found in cmux."
-  # 写入空 state（覆盖旧数据）
-  echo '{}' > "$TMPDIR_SCAN/result.json"
-  mv "$TMPDIR_SCAN/result.json" "$STATE_FILE"
+  # periodic 模式：空结果不覆盖、不更新 prev
+  # 普通模式：写入空 state
+  if [ -z "$PERIODIC" ]; then
+    echo '{}' > "$TMPDIR_SCAN/result.json"
+    mv "$TMPDIR_SCAN/result.json" "$STATE_FILE"
+  fi
   exit 0
 fi
 
 log "Found ${C_YELLOW}$SURFACE_COUNT${C_RESET} OpenCode surface(s) in cmux. Scanning..."
 
-# ── 3. 获取 opencode 进程 → tty → env 映射 ──
+# ── 获取 opencode 进程 → tty → env 映射 ──
 PID_MAP="[]"
 for pid in $(ps -eo pid=,comm= | grep ' opencode$' | awk '{print $1}'); do
   tty=$(ps -o tty= -p "$pid" 2>/dev/null | xargs)
@@ -97,8 +104,8 @@ for pid in $(ps -eo pid=,comm= | grep ' opencode$' | awk '{print $1}'); do
 done
 echo "$PID_MAP" > "$TMPDIR_SCAN/pid_map.json"
 
-# ── 4. 获取 opencode session list ──
-opencode session list -n 200 --format json > "$TMPDIR_SCAN/sessions.json" 2>/dev/null || { log "Error: opencode session list failed."; exit 1; }
+# ── 获取 opencode session list ──
+opencode session list -n 200 --format json > "$TMPDIR_SCAN/sessions.json" 2>/dev/null || exit 0
 
 # ── 辅助函数 ──
 match_session_exact() {
@@ -135,26 +142,20 @@ extract_screen_title() {
 
   local sid
   sid=$(match_session_exact "$line2")
-  if [ -n "$sid" ]; then
-    echo "$line2"
-    return
-  fi
+  if [ -n "$sid" ]; then echo "$line2"; return; fi
 
   local line3
   line3=$(echo "$screen" | sed -n '3p' | cut -c${start_col}- | xargs)
   if [ -n "$line3" ] && [ "$line3" != "Context" ]; then
     local combined="$line2 $line3"
     sid=$(match_session_exact "$combined")
-    if [ -n "$sid" ]; then
-      echo "$combined"
-      return
-    fi
+    if [ -n "$sid" ]; then echo "$combined"; return; fi
   fi
 
   echo "$line2"
 }
 
-# ── 5. 逐个 workspace 扫描，构建结果 JSON ──
+# ── 逐个 workspace 扫描，构建结果 JSON ──
 RESULT="{}"
 FOUND=0
 SKIPPED=0
@@ -165,7 +166,6 @@ for i in $(seq 0 $(( SURFACE_COUNT - 1 ))); do
   WS_SESSION_TITLE=$(jq -r ".[$i].ws_session_title" "$TMPDIR_SCAN/surfaces.json")
   TTY=$(jq -r ".[$i].tty" "$TMPDIR_SCAN/surfaces.json")
 
-  # tty → CMUX env
   MATCH=$(jq -r --arg tty "$TTY" '.[] | select(.tty == $tty) | @json' "$TMPDIR_SCAN/pid_map.json" | head -1)
   if [ -z "$MATCH" ]; then
     log "  ${C_DIM}SKIP${C_RESET}  \"$WS_TITLE\" ${C_DIM}(no opencode process on tty=$TTY)${C_RESET}"
@@ -177,24 +177,20 @@ for i in $(seq 0 $(( SURFACE_COUNT - 1 ))); do
   WORKSPACE_ID=$(echo "$MATCH" | jq -r '.workspace')
   CWD=$(echo "$MATCH" | jq -r '.cwd')
 
-  # 三级 fallback 匹配
   SESSION_ID=""
   MATCH_LEVEL=""
 
-  # Level 1+2: read-screen
   SCREEN_TITLE=$(extract_screen_title "$WS_REF")
   if [ -n "$SCREEN_TITLE" ]; then
     SESSION_ID=$(match_session_exact "$SCREEN_TITLE")
     [ -n "$SESSION_ID" ] && MATCH_LEVEL="screen"
   fi
 
-  # Level 3: workspace 标题
   if [ -z "$SESSION_ID" ]; then
     SESSION_ID=$(match_session_exact "$WS_SESSION_TITLE")
     [ -n "$SESSION_ID" ] && MATCH_LEVEL="ws-title"
   fi
 
-  # Level 4: 模糊匹配
   if [ -z "$SESSION_ID" ] && [ -n "$SCREEN_TITLE" ]; then
     SESSION_ID=$(match_session_fuzzy "$SCREEN_TITLE")
     [ -n "$SESSION_ID" ] && MATCH_LEVEL="fuzzy-screen"
@@ -210,7 +206,6 @@ for i in $(seq 0 $(( SURFACE_COUNT - 1 ))); do
     continue
   fi
 
-  # 添加到结果 JSON（内存中累积，最后一次性写入）
   RESULT=$(echo "$RESULT" | jq \
     --arg s "$SURFACE_ID" --arg sid "$SESSION_ID" --arg w "$WORKSPACE_ID" --arg c "$CWD" \
     '.[$s] = {sessionId: $sid, workspaceId: $w, cwd: $c}')
@@ -219,9 +214,49 @@ for i in $(seq 0 $(( SURFACE_COUNT - 1 ))); do
   FOUND=$((FOUND + 1))
 done
 
-# ── 6. 原子写入：先 tmp 再 mv ──
+# ── 写入逻辑 ──
 echo "$RESULT" > "$TMPDIR_SCAN/result.json"
-mv "$TMPDIR_SCAN/result.json" "$STATE_FILE"
+
+# 提取当前 session ID 集合（排序后，一行一个）
+CURRENT_IDS=$(jq -r '[.[].sessionId] | sort | .[]' "$TMPDIR_SCAN/result.json")
+
+if [ -n "$PERIODIC" ]; then
+  # ── periodic 模式：状态机判断是否保存 ──
+
+  # 空结果 → 不保存、不更新 prev
+  if [ -z "$CURRENT_IDS" ]; then
+    exit 0
+  fi
+
+  # 读取上次扫描的 ID 集合
+  PREV_IDS=$(cat "$PREV_IDS_FILE" 2>/dev/null || echo "")
+
+  # 更新 prev 为本次结果
+  echo "$CURRENT_IDS" > "$PREV_IDS_FILE"
+
+  # 和上次不一致 → 状态变化中，不保存
+  if [ "$CURRENT_IDS" != "$PREV_IDS" ]; then
+    exit 0
+  fi
+
+  # 和已保存的一致 → 无新变化，不重复保存
+  SAVED_IDS=$(cat "$SAVED_IDS_FILE" 2>/dev/null || echo "")
+  if [ "$CURRENT_IDS" = "$SAVED_IDS" ]; then
+    exit 0
+  fi
+
+  # 连续两次一致 + 未保存过 → 保存！
+  mv "$TMPDIR_SCAN/result.json" "$STATE_FILE"
+  echo "$CURRENT_IDS" > "$SAVED_IDS_FILE"
+
+else
+  # ── 普通模式：直接保存 ──
+  mv "$TMPDIR_SCAN/result.json" "$STATE_FILE"
+  # 同步 saved_ids（避免下次 periodic 误判为"已保存"）
+  echo "$CURRENT_IDS" > "$SAVED_IDS_FILE"
+  # 同步 prev_ids
+  echo "$CURRENT_IDS" > "$PREV_IDS_FILE"
+fi
 
 log ""
 if [ "$SKIPPED" -eq 0 ]; then

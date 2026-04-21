@@ -6,6 +6,8 @@
 : "${STATE_DIR:=$HOME/.local/state/oc-session-restore}"
 : "${STATE_FILE:=$STATE_DIR/state.json}"
 : "${SCAN_PID_FILE:=$STATE_DIR/scan.pid}"
+: "${PREV_IDS_FILE:=$STATE_DIR/prev_ids.txt}"
+: "${SAVED_IDS_FILE:=$STATE_DIR/saved_ids.txt}"
 
 # 清空 state file
 state_clear() {
